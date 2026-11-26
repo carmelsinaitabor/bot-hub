@@ -17,6 +17,14 @@ on:
         required: false
         type: string
         default: ""
+      template_name:
+        required: false
+        type: string
+        default: ""
+      template_lang:
+        required: false
+        type: string
+        default: ""
     secrets:
       WHATSAPP_TO:
         required: false
@@ -25,6 +33,12 @@ on:
       WHATSAPP_TOKEN:
         required: false
       WHATSAPP_PHONE_ID:
+        required: false
+      WHATSAPP_TEMPLATE_NAME:
+        required: false
+      WHATSAPP_TEMPLATE_LANG:
+        required: false
+      WHATSAPP_TEMPLATE_PARAM_COUNT:
         required: false
       GH_PAT:
         required: false
@@ -49,6 +63,11 @@ jobs:
           CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
           WHATSAPP_TOKEN: ${{ secrets.WHATSAPP_TOKEN }}
           WHATSAPP_PHONE_ID: ${{ secrets.WHATSAPP_PHONE_ID }}
+          WHATSAPP_TEMPLATE_NAME: ${{ secrets.WHATSAPP_TEMPLATE_NAME }}
+          WHATSAPP_TEMPLATE_LANG: ${{ secrets.WHATSAPP_TEMPLATE_LANG }}
+          WHATSAPP_TEMPLATE_PARAM_COUNT: ${{ secrets.WHATSAPP_TEMPLATE_PARAM_COUNT }}
+          INPUT_TEMPLATE_NAME: ${{ inputs.template_name }}
+          INPUT_TEMPLATE_LANG: ${{ inputs.template_lang }}
           GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
@@ -58,7 +77,7 @@ jobs:
           ISSUE_NUM: ${{ inputs.issue_number }}
         run: |
           python3 - << 'PYWA'
-          import os, subprocess, urllib.parse, requests
+          import os, re, subprocess, urllib.parse, requests
 
           phone = "".join(ch for ch in (os.environ.get("WHATSAPP_TO") or "6581115505") if ch.isdigit())
           repo = os.environ["REPO"]
@@ -76,19 +95,92 @@ jobs:
           msg = "\n".join(lines)
           wa_link = f"https://wa.me/{phone}?text={urllib.parse.quote(msg)}"
 
-          sent_via = "wa.me fallback link (add CALLMEBOT_API_KEY or WHATSAPP_TOKEN for direct push)"
+          def clean_param(val, limit=900):
+              # Meta Cloud API rejects newlines, tabs, or >4 consecutive spaces inside template variables
+              return re.sub(r"\s+", " ", str(val or "")).strip()[:limit] or "-"
 
+          def send_meta_template(url, headers, to_phone, tmpl_name, tmpl_lang, param_count_raw):
+              if tmpl_name == "hello_world" and not param_count_raw:
+                  param_count = 0
+              elif param_count_raw.isdigit():
+                  param_count = int(param_count_raw)
+              else:
+                  param_count = 2
+
+              candidate_params = [
+                  clean_param(f"[{status}] {repo}: {title}"),
+                  clean_param(f"{details} | {run_url}" if details else run_url),
+                  clean_param(run_url),
+              ]
+
+              template_obj = {
+                  "name": tmpl_name,
+                  "language": {"code": tmpl_lang or "en_US"},
+              }
+              if param_count > 0:
+                  template_obj["components"] = [
+                      {
+                          "type": "body",
+                          "parameters": [
+                              {"type": "text", "text": p}
+                              for p in candidate_params[:param_count]
+                          ],
+                      }
+                  ]
+
+              payload = {
+                  "messaging_product": "whatsapp",
+                  "to": to_phone,
+                  "type": "template",
+                  "template": template_obj,
+              }
+              resp = requests.post(url, headers=headers, json=payload, timeout=20)
+              if not resp.ok:
+                  print(f"Meta template error ({resp.status_code}): {resp.text}")
+                  resp.raise_for_status()
+              return f"Meta WhatsApp Template ({tmpl_name})"
+
+          sent_via = "wa.me fallback link (add WHATSAPP_TOKEN + WHATSAPP_PHONE_ID or CALLMEBOT_API_KEY)"
           wa_token = (os.environ.get("WHATSAPP_TOKEN") or "").strip()
           wa_phone_id = (os.environ.get("WHATSAPP_PHONE_ID") or "").strip()
+          tmpl_name = (os.environ.get("INPUT_TEMPLATE_NAME") or os.environ.get("WHATSAPP_TEMPLATE_NAME") or "").strip()
+          tmpl_lang = (os.environ.get("INPUT_TEMPLATE_LANG") or os.environ.get("WHATSAPP_TEMPLATE_LANG") or "en_US").strip()
+          param_count_raw = (os.environ.get("WHATSAPP_TEMPLATE_PARAM_COUNT") or "").strip()
+
           if wa_token and wa_phone_id:
-              r = requests.post(
-                  f"https://graph.facebook.com/v21.0/{wa_phone_id}/messages",
-                  headers={"Authorization": f"Bearer {wa_token}", "Content-Type": "application/json"},
-                  json={"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": msg}},
-                  timeout=20,
-              )
-              r.raise_for_status()
-              sent_via = "Meta WhatsApp Cloud API"
+              graph_url = f"https://graph.facebook.com/v21.0/{wa_phone_id}/messages"
+              meta_headers = {
+                  "Authorization": f"Bearer {wa_token}",
+                  "Content-Type": "application/json",
+              }
+              if tmpl_name:
+                  sent_via = send_meta_template(graph_url, meta_headers, phone, tmpl_name, tmpl_lang, param_count_raw)
+              else:
+                  text_resp = requests.post(
+                      graph_url,
+                      headers=meta_headers,
+                      json={
+                          "messaging_product": "whatsapp",
+                          "to": phone,
+                          "type": "text",
+                          "text": {"body": msg},
+                      },
+                      timeout=20,
+                  )
+                  if text_resp.ok:
+                      sent_via = "Meta WhatsApp Cloud API (text)"
+                  else:
+                      err_code = 0
+                      try:
+                          err_code = text_resp.json().get("error", {}).get("code", 0)
+                      except Exception:
+                          pass
+                      print(f"Meta text notice ({text_resp.status_code}, code={err_code}): {text_resp.text}")
+                      if err_code == 131047:
+                          # Outside 24-hour window: fall back to Meta's built-in hello_world template
+                          sent_via = send_meta_template(graph_url, meta_headers, phone, "hello_world", "en_US", "0")
+                      else:
+                          text_resp.raise_for_status()
           elif (os.environ.get("CALLMEBOT_API_KEY") or "").strip():
               r = requests.get(
                   "https://api.callmebot.com/whatsapp.php",
