@@ -1,0 +1,184 @@
+name: Reusable Coder Bot (Patch PR Generator)
+
+on:
+  workflow_call:
+    inputs:
+      run_id:
+        description: "Failed workflow run ID or issue tracking ID"
+        required: true
+        type: string
+      diagnosis:
+        description: "Root cause diagnosis from Chief bot"
+        required: true
+        type: string
+      target_file:
+        description: "Target Python file to patch"
+        required: false
+        default: "devotional_pipeline_v2.py"
+        type: string
+    secrets:
+      GH_PAT:
+        required: false
+      GCP_SA_KEY:
+        required: false
+      GCP_PROJECT:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  propose-fix-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: \${{ secrets.GH_PAT || github.token }}
+          fetch-depth: 1
+
+      - name: Load Bot Lessons & Guardrails for Patching
+        run: |
+          echo "Role: Propose a minimal, scoped fix PR on a bot/* branch. Never push directly to main."
+          [ -f BOT_LESSONS_AND_GUARDRAILS.md ] && cat BOT_LESSONS_AND_GUARDRAILS.md || true
+
+      - name: Check GCP credentials
+        id: check_gcp
+        env:
+          GCP_SA_KEY: \${{ secrets.GCP_SA_KEY }}
+        run: |
+          python3 - << 'PYJSON'
+          import json, os
+          raw = os.environ.get("GCP_SA_KEY", "").strip()
+          ok = False
+          if raw.startswith("{"):
+              try:
+                  d = json.loads(raw)
+                  ok = isinstance(d, dict) and bool(d.get("client_email"))
+              except Exception:
+                  ok = False
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("has_key=" + ("true" if ok else "false") + "\n")
+          print("Valid GCP_SA_KEY JSON present:", ok)
+          PYJSON
+
+      - name: Authenticate to Google Cloud (Vertex AI)
+        id: auth
+        if: \${{ steps.check_gcp.outputs.has_key == 'true' }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: \${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install google-genai pyyaml
+
+      - name: Generate candidate patch
+        env:
+          RUN_ID: \${{ inputs.run_id }}
+          DIAGNOSIS: \${{ inputs.diagnosis }}
+          TARGET_FILE: \${{ inputs.target_file }}
+          GCP_PROJECT: \${{ secrets.GCP_PROJECT }}
+          GEMINI_API_KEY: \${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 - << 'PY'
+          import json, os, py_compile, subprocess, sys
+          from pathlib import Path
+          from google import genai
+
+          run_id = os.environ.get("RUN_ID", "unknown")
+          diagnosis = os.environ.get("DIAGNOSIS", "")
+          target_name = os.environ.get("TARGET_FILE", "devotional_pipeline_v2.py").strip() or "devotional_pipeline_v2.py"
+          gcp_project = os.environ.get("GCP_PROJECT", "").strip()
+          creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+          api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+          target = Path(target_name)
+          if not target.exists():
+              print(f"{target_name} not found; skipping patch.")
+              sys.exit(0)
+
+          code = target.read_text(encoding="utf-8")
+          guardrails = open("BOT_LESSONS_AND_GUARDRAILS.md", encoding="utf-8").read()[:3000] if os.path.exists("BOT_LESSONS_AND_GUARDRAILS.md") else ""
+
+          client = None
+          if creds_path and gcp_project:
+              client = genai.Client(vertexai=True, project=gcp_project, location="global")
+          elif api_key:
+              client = genai.Client(api_key=api_key)
+
+          if client is None:
+              print("No Gemini client available; skipping patch.")
+              sys.exit(0)
+
+          prompt = (
+              f"You are Coder, a surgical Python patch bot for {target_name}.\n"
+              "Follow these guardrails strictly:\n"
+              f"{guardrails}\n\n"
+              "Keep [DRY_RUN] intact if present, define helper functions above callers and above main(), and make a minimal scoped fix.\n"
+              "Reply ONLY in valid JSON with keys: has_safe_fix, commit_message, updated_code.\n\n"
+              f"CHIEF DIAGNOSIS:\n{diagnosis}\n\nCURRENT CODE:\n{code}"
+          )
+
+          resp = None
+          for m in ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"):
+              try:
+                  resp = client.models.generate_content(model=m, contents=prompt)
+                  break
+              except Exception as e:
+                  print(f"Coder model {m} notice: {e}")
+
+          if resp is None:
+              sys.exit(0)
+
+          raw = (resp.text or "").strip()
+          if raw.startswith("```"):
+              raw = raw.strip("`").replace("json", "", 1).strip()
+          data = json.loads(raw)
+
+          candidate = data.get("updated_code") or data.get("updated_devotional_pipeline_v2")
+          if not data.get("has_safe_fix") or not candidate:
+              print("No safe automated fix determined.")
+              sys.exit(0)
+
+          if "[DRY_RUN]" in code:
+              assert "[DRY_RUN]" in candidate, "Candidate dropped DRY_RUN guard"
+
+          tmp_path = "/tmp/candidate_patch.py"
+          open(tmp_path, "w", encoding="utf-8").write(candidate)
+          py_compile.compile(tmp_path, doraise=True)
+
+          target.write_text(candidate, encoding="utf-8")
+          if os.path.exists("scripts/check_bot_guardrails.py"):
+              subprocess.run([sys.executable, "scripts/check_bot_guardrails.py"], check=True)
+          open("/tmp/commit_msg.txt", "w", encoding="utf-8").write(data.get("commit_message", f"fix: automated patch for {run_id}"))
+          PY
+
+      - name: Commit to bot branch and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          TARGET_FILE: ${{ inputs.target_file }}
+        run: |
+          TARGET_NAME="${TARGET_FILE:-devotional_pipeline_v2.py}"
+          if git diff --quiet "$TARGET_NAME"; then
+            echo "No changes made to $TARGET_NAME; no PR needed."
+            exit 0
+          fi
+          BRANCH="bot/fix-${RUN_ID}-${GITHUB_RUN_NUMBER}"
+          git config user.name "bot-coder[bot]"
+          git config user.email "bot-coder[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add "$TARGET_NAME"
+          MSG=$(cat /tmp/commit_msg.txt 2>/dev/null || echo "fix: patch from Coder bot for ${RUN_ID}")
+          git commit -m "$MSG"
+          git push -u origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" --title "$MSG" --body "Automated fix proposed by Coder Bot for ${RUN_ID}."

@@ -1,0 +1,73 @@
+name: Reusable Weekly Stage & Pre-Flight (Sun 9PM SGT)
+
+on:
+  workflow_call:
+    inputs:
+      preview_file:
+        description: "Path to staged preview JSON artifact"
+        required: false
+        default: "sandbox_week/latest_week_preview.json"
+        type: string
+    secrets:
+      GH_TOKEN:
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  stage-next-week:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pytest requests pyyaml
+          fi
+
+      - name: Validate pipeline and stage upcoming week preview
+        run: |
+          python3 -m compileall -q .
+          if [ -f test_pipeline.py ]; then
+            pytest -q test_pipeline.py
+          elif ls test_*.py >/dev/null 2>&1; then
+            pytest -q
+          fi
+          if [ -f scripts/weekly_stage.py ]; then
+            python3 scripts/weekly_stage.py
+          else
+            echo "No scripts/weekly_stage.py found; skipping staging."
+          fi
+
+      - name: Commit staged preview
+        env:
+          PREVIEW_FILE: ${{ inputs.preview_file }}
+        run: |
+          if [ -f "$PREVIEW_FILE" ]; then
+            git config user.name "bot-stage[bot]"
+            git config user.email "bot-stage[bot]@users.noreply.github.com"
+            git add -f "$PREVIEW_FILE"
+            git diff --staged --quiet || git commit -m "chore(sandbox): stage weekly preview"
+            git push
+          fi
+
+      - name: Open Weekly Review & Auto-Approve Issue
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ -f scripts/weekly_stage.py ]; then
+            python3 scripts/weekly_stage.py --create-issue
+          fi
