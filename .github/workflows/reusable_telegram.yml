@@ -1,0 +1,84 @@
+name: Reusable Telegram Alert
+on:
+  workflow_call:
+    inputs:
+      event_title:
+        required: true
+        type: string
+      status:
+        required: false
+        type: string
+        default: "info"
+      details:
+        required: false
+        type: string
+        default: ""
+      issue_number:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      TELEGRAM_BOT_TOKEN:
+        required: true
+      TELEGRAM_CHAT_ID:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  send-telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install requests
+        run: pip install requests
+      - name: Send Telegram Notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_TITLE: ${{ inputs.event_title }}
+          STATUS: ${{ inputs.status }}
+          DETAILS: ${{ inputs.details }}
+        run: |
+          python3 - << 'PYTG'
+          import html, os, requests
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+          chat_id = os.environ["TELEGRAM_CHAT_ID"].strip()
+          repo = html.escape(os.environ["REPO"])
+          run_id = os.environ["RUN_ID"]
+          title = html.escape(os.environ["EVENT_TITLE"])
+          status = html.escape(os.environ.get("STATUS", "info").upper())
+          details = html.escape((os.environ.get("DETAILS") or "").strip())
+          run_url = f"https://github.com/{os.environ['REPO']}/actions/runs/{run_id}"
+
+          icon = "✅" if status in ("SUCCESS", "CLOSED", "COMPLETED") else ("❌" if status in ("FAILURE", "CANCELLED", "TIMED_OUT") else "🤖")
+          lines = [
+              f"{icon} <b>[{status}] {repo}</b>",
+              title,
+          ]
+          if details:
+              lines.append(f"<pre>{details[:600]}</pre>")
+          lines.append(f'<a href="{run_url}">View Workflow Run</a>')
+
+          resp = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={
+                  "chat_id": chat_id,
+                  "text": "\n".join(lines),
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": True,
+              },
+              timeout=20,
+          )
+          if not resp.ok:
+              print(f"Telegram API error ({resp.status_code}): {resp.text}")
+              resp.raise_for_status()
+          print("Telegram alert delivered successfully.")
+          PYTG
