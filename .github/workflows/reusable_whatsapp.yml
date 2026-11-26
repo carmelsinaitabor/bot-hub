@@ -1,0 +1,112 @@
+name: Reusable WhatsApp Alert
+on:
+  workflow_call:
+    inputs:
+      event_title:
+        required: true
+        type: string
+      status:
+        required: false
+        type: string
+        default: "info"
+      details:
+        required: false
+        type: string
+        default: ""
+      issue_number:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      WHATSAPP_TO:
+        required: false
+      CALLMEBOT_API_KEY:
+        required: false
+      WHATSAPP_TOKEN:
+        required: false
+      WHATSAPP_PHONE_ID:
+        required: false
+      GH_PAT:
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  send-whatsapp:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install requests
+        run: pip install requests
+      - name: Send WhatsApp Alert (+65 81115505)
+        env:
+          WHATSAPP_TO: ${{ secrets.WHATSAPP_TO }}
+          CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
+          WHATSAPP_TOKEN: ${{ secrets.WHATSAPP_TOKEN }}
+          WHATSAPP_PHONE_ID: ${{ secrets.WHATSAPP_PHONE_ID }}
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_TITLE: ${{ inputs.event_title }}
+          STATUS: ${{ inputs.status }}
+          DETAILS: ${{ inputs.details }}
+          ISSUE_NUM: ${{ inputs.issue_number }}
+        run: |
+          python3 - << 'PYWA'
+          import os, subprocess, urllib.parse, requests
+
+          phone = "".join(ch for ch in (os.environ.get("WHATSAPP_TO") or "6581115505") if ch.isdigit())
+          repo = os.environ["REPO"]
+          run_id = os.environ["RUN_ID"]
+          title = os.environ["EVENT_TITLE"]
+          status = os.environ.get("STATUS", "info").upper()
+          details = (os.environ.get("DETAILS") or "").strip()
+          issue_num = (os.environ.get("ISSUE_NUM") or "").strip()
+          run_url = f"https://github.com/{repo}/actions/runs/{run_id}"
+
+          lines = [f"*[{status}] {repo}*", title]
+          if details:
+              lines.append(details[:500])
+          lines.append(f"Run: {run_url}")
+          msg = "\n".join(lines)
+          wa_link = f"https://wa.me/{phone}?text={urllib.parse.quote(msg)}"
+
+          sent_via = "wa.me fallback link (add CALLMEBOT_API_KEY or WHATSAPP_TOKEN for direct push)"
+
+          wa_token = (os.environ.get("WHATSAPP_TOKEN") or "").strip()
+          wa_phone_id = (os.environ.get("WHATSAPP_PHONE_ID") or "").strip()
+          if wa_token and wa_phone_id:
+              r = requests.post(
+                  f"https://graph.facebook.com/v21.0/{wa_phone_id}/messages",
+                  headers={"Authorization": f"Bearer {wa_token}", "Content-Type": "application/json"},
+                  json={"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": msg}},
+                  timeout=20,
+              )
+              r.raise_for_status()
+              sent_via = "Meta WhatsApp Cloud API"
+          elif (os.environ.get("CALLMEBOT_API_KEY") or "").strip():
+              r = requests.get(
+                  "https://api.callmebot.com/whatsapp.php",
+                  params={"phone": phone, "text": msg, "apikey": os.environ["CALLMEBOT_API_KEY"].strip()},
+                  timeout=20,
+              )
+              r.raise_for_status()
+              sent_via = "CallMeBot API"
+
+          print(f"WhatsApp dispatch status: {sent_via}")
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(f"### WhatsApp Alert (+{phone})\n- **Delivery:** {sent_via}\n- **Direct Link:** [Open in WhatsApp]({wa_link})\n")
+
+          if issue_num and "fallback" in sent_via:
+              subprocess.run(
+                  ["gh", "issue", "comment", issue_num, "--repo", repo, "--body", f"📲 **WhatsApp Dispatch (+{phone}):** [Send Alert via WhatsApp]({wa_link})"],
+                  check=False,
+              )
+          PYWA
