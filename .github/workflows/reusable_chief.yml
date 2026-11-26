@@ -1,0 +1,181 @@
+name: Reusable Chief Bot
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: false
+        type: string
+        default: ""
+      run_id:
+        required: false
+        type: string
+        default: ""
+      coder_workflow_file:
+        required: false
+        type: string
+        default: "coder.yml"
+    secrets:
+      GH_PAT:
+        required: false
+      GCP_SA_KEY:
+        required: false
+      GCP_PROJECT:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+jobs:
+  triage-failure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+      - name: Load Bot Lessons & Guardrails for Triage
+        run: |
+          echo "Role: Diagnose failures only. Do not push code directly to main."
+          [ -f BOT_LESSONS_AND_GUARDRAILS.md ] && cat BOT_LESSONS_AND_GUARDRAILS.md || true
+      - name: Check GCP credentials
+        id: check_gcp
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          python3 - << 'PYJSON'
+          import json, os
+          raw = os.environ.get("GCP_SA_KEY", "").strip()
+          ok = False
+          if raw.startswith("{"):
+              try:
+                  d = json.loads(raw)
+                  ok = isinstance(d, dict) and bool(d.get("client_email"))
+              except Exception:
+                  ok = False
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("has_key=" + ("true" if ok else "false") + "\n")
+          PYJSON
+      - name: Authenticate to Google Cloud (Vertex AI)
+        if: ${{ steps.check_gcp.outputs.has_key == 'true' }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install google-genai requests
+      - name: Triage issue or failed workflow run
+        id: triage
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          REPO: ${{ github.repository }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+          INPUT_ISSUE_NUM: ${{ inputs.issue_number }}
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 - << 'PY'
+          import json, os, re, requests
+          from google import genai
+
+          repo = os.environ["REPO"]
+          run_id = (os.environ.get("INPUT_RUN_ID") or "").strip()
+          issue_num = (os.environ.get("INPUT_ISSUE_NUM") or "").strip()
+          token = os.environ["GH_TOKEN"]
+          gcp_project = os.environ.get("GCP_PROJECT", "").strip()
+          creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+          api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+          guardrails = open("BOT_LESSONS_AND_GUARDRAILS.md", encoding="utf-8").read()[:3000] if os.path.exists("BOT_LESSONS_AND_GUARDRAILS.md") else ""
+          headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+          log_excerpt = ""
+          existing_issue = bool(issue_num)
+
+          if issue_num:
+              ir = requests.get(f"https://api.github.com/repos/{repo}/issues/{issue_num}", headers=headers, timeout=20)
+              if ir.ok:
+                  idata = ir.json()
+                  log_excerpt = f"Issue #{issue_num}: {idata.get('title', '')}\n\n{idata.get('body', '')}"[:4000]
+
+          if not log_excerpt and not run_id:
+              runs_r = requests.get(f"https://api.github.com/repos/{repo}/actions/runs?per_page=15", headers=headers, timeout=20)
+              if runs_r.ok:
+                  for r_item in runs_r.json().get("workflow_runs", []):
+                      if r_item.get("conclusion") == "failure" and "Chief" not in r_item.get("name", ""):
+                          run_id = str(r_item.get("id", ""))
+                          break
+
+          if not log_excerpt and run_id:
+              jr = requests.get(f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs", headers=headers, timeout=20)
+              if jr.ok:
+                  for job in jr.json().get("jobs", []):
+                      if job.get("conclusion") == "failure":
+                          lr = requests.get(f"https://api.github.com/repos/{repo}/actions/jobs/{job['id']}/logs", headers=headers, timeout=30)
+                          if lr.ok:
+                              log_excerpt = "\n".join(lr.text.splitlines()[-120:])
+                          break
+
+          if not log_excerpt:
+              log_excerpt = f"Triage check (run_id={run_id or 'none'}, issue={issue_num or 'none'})."
+
+          resolved_run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", f"issue-{issue_num}" if issue_num else (run_id or "manual")).strip("-") or "manual"
+          should_patch = "false"
+          diagnosis = "Transient or external failure; monitor next run."
+          title = f"Pipeline triage for {resolved_run_id}"[:80]
+
+          client = genai.Client(vertexai=True, project=gcp_project, location="global") if (creds_path and gcp_project) else (genai.Client(api_key=api_key) if api_key else None)
+          if client is not None:
+              prompt = f"You are Chief, a triage bot.\nGuardrails:\n{guardrails}\nReply ONLY JSON with keys: classification, should_dispatch_coder, title, diagnosis.\nLOG:\n{log_excerpt}"
+              for m in ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"):
+                  try:
+                      raw = (client.models.generate_content(model=m, contents=prompt).text or "").strip().strip("`")
+                      if raw.startswith("json"):
+                          raw = raw[4:].strip()
+                      parsed = json.loads(raw)
+                      should_patch = "true" if parsed.get("should_dispatch_coder") and parsed.get("classification") == "code_bug" else "false"
+                      diagnosis = str(parsed.get("diagnosis", diagnosis))
+                      title = str(parsed.get("title", title))[:80]
+                      break
+                  except Exception as e:
+                      print(f"Model {m} notice: {e}")
+
+          with open("/tmp/triage.json", "w", encoding="utf-8") as f:
+              json.dump({"should_patch": should_patch, "resolved_run_id": resolved_run_id, "issue_num": issue_num, "existing_issue": existing_issue, "title": title, "diagnosis": diagnosis}, f)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"should_patch={should_patch}\nresolved_run_id={resolved_run_id}\n")
+          PY
+      - name: Update or Open GitHub Issue
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          python3 - << 'PY'
+          import json, subprocess
+          t = json.load(open("/tmp/triage.json", encoding="utf-8"))
+          body = f"### Chief Triage Report\n\n- **Tracking ID:** `{t['resolved_run_id']}`\n- **Dispatch Coder:** `{t['should_patch']}`\n\n### Diagnosis\n{t['diagnosis']}"
+          subprocess.run(["gh", "label", "create", "bot-triage", "--color", "d93f0b", "--description", "Chief bot triage"], capture_output=True, text=True)
+          if t.get("existing_issue") and t.get("issue_num"):
+              subprocess.run(["gh", "issue", "comment", str(t["issue_num"]), "--body", body], check=False)
+              subprocess.run(["gh", "issue", "edit", str(t["issue_num"]), "--add-label", "bot-triage"], check=False)
+          else:
+              subprocess.run(["gh", "issue", "create", "--title", t["title"], "--body", body], check=False)
+          PY
+      - name: Dispatch Coder workflow if safe code bug
+        if: ${{ steps.triage.outputs.should_patch == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          RUN_ID: ${{ steps.triage.outputs.resolved_run_id }}
+          CODER_WF: ${{ inputs.coder_workflow_file }}
+        run: |
+          python3 - << 'PYGUARD'
+          import json, os, subprocess
+          prs = json.loads(subprocess.check_output(["gh", "pr", "list", "--state", "open", "--json", "headRefName"], text=True) or "[]")
+          if sum(1 for pr in prs if str(pr.get("headRefName", "")).startswith("bot/fix-")) >= 2:
+              print("Loop guard active.")
+              raise SystemExit(0)
+          triage = json.load(open("/tmp/triage.json", encoding="utf-8"))
+          subprocess.run(["gh", "workflow", "run", os.environ["CODER_WF"], "-f", f"run_id={os.environ['RUN_ID']}", "-f", f"diagnosis={triage.get('diagnosis', '')}"], check=True)
+          PYGUARD

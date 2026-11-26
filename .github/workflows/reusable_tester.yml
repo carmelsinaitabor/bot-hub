@@ -1,0 +1,40 @@
+name: Reusable Checker & Tester Bot
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python3 -m pip install --quiet pytest requests pyyaml
+      - name: Read Bot Lessons & Guardrails
+        run: |
+          echo "Role: Verify syntax, unit tests, and known regressions on PRs to main."
+          [ -f BOT_LESSONS_AND_GUARDRAILS.md ] && cat BOT_LESSONS_AND_GUARDRAILS.md || true
+      - name: Syntax & Regression Checks
+        run: |
+          if [ -f scripts/check_bot_guardrails.py ]; then
+            python3 scripts/check_bot_guardrails.py
+          else
+            python3 -m compileall -q .
+          fi
+      - name: Run unit tests
+        run: |
+          if [ -f test_pipeline.py ]; then
+            pytest -q test_pipeline.py
+          elif ls test_*.py >/dev/null 2>&1; then
+            pytest -q
+          else
+            echo "No pytest files found"
+          fi
