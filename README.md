@@ -64,3 +64,24 @@ All helpers accept a short repository name (such as `tcm_basics`), a full `owner
 - **Assign a task to Chief:** Send `/chief <repo> <task>` in **Carmel Bot Alerts** (for example, `/chief bible_dailydevotional Check cover rotation warning`). Multi-line messages work too—line 1 becomes the issue title and subsequent lines become the issue body.
 - **List commands & repos:** Send `/chief help`.
 - **Timing & security:** GitHub Actions (`bot-hub/telegram_poller.yml`) polls Telegram automatically (typically every 5–15 minutes depending on GitHub's queue), ignores messages from any chat other than `TELEGRAM_CHAT_ID`, and replies with the created GitHub Issue link.
+
+## Bot Operations Reference
+
+### Telegram Commands (Carmel Bot Alerts)
+- `/chief` — Run Chief triage on recent failures
+- `/chief <issue_num>` — Triage a specific issue number
+- `/chief <task>` — Create a new issue for Chief triage & Coder PR dispatch
+- `/run` or `/run_devo` — Trigger `daily_devo2.yml` manually
+- `/status` or `/s` — Check latest `daily_devo2.yml` status
+- `/links` or `/wa` — Fetch WhatsApp dispatch links from Issue #2
+- `/issues` or `/open` — List open bot issues
+- `/stuck` — Check untriaged or stalled bot issues
+- `/closed` — List recently closed issues
+- `/help` — Show command menu
+
+### Cloud Shell Helpers (`~/.bashrc`)
+- `gh-open` — List open issues
+- `gh-closed` — List recently closed issues
+- `gh-resolved` — View recent PRs and closed issues
+- `gh-stuck` — Identify untriaged issues or triaged issues without open bot PRs
+- `gh-clean-tests` — Close test issues and delete `bot/fix-*` test PR branches
