@@ -130,7 +130,7 @@ jobs:
           client = genai.Client(vertexai=True, project=gcp_project, location="global") if (creds_path and gcp_project) else (genai.Client(api_key=api_key) if api_key else None)
           if client is not None:
               prompt = f"You are Chief, a triage bot.\nGuardrails:\n{guardrails}\nReply ONLY JSON with keys: classification, should_dispatch_coder, title, diagnosis.\nLOG:\n{log_excerpt}"
-              for m in ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"):
+              for m in ("gemini-3.8-flash", "gemini-3.5-flash-lite"):
                   try:
                       raw = (client.models.generate_content(model=m, contents=prompt).text or "").strip().strip("`")
                       if raw.startswith("json"):
