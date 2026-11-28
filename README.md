@@ -3,6 +3,11 @@
 
 **`gh api repos/carmelsinaitabor/bot-hub/contents/SYSTEM_ARCHITECTURE.md --jq '.content' | base64 -d`**
 
+### How It Works
+- **Cloud Shell Alias (`ctx`):** Stored in `~/.bashrc` on Google Cloud Shell (`dailydevotion-515202`); expands to the `gh api` command above to fetch and decode `SYSTEM_ARCHITECTURE.md` in one word.
+- **Portable GitHub Script (`scripts/ctx`):** Committed directly in this repository with executable permissions (`chmod +x`, mode `100755`). Whenever `bot-hub` is cloned in Cloud Shell, a GitHub Actions runner, or another machine, run `./scripts/ctx` to print the latest handover document without relying on local shell aliases.
+- **Source of Truth (`SYSTEM_ARCHITECTURE.md`):** Holds the live topology, entrypoints (`devotional_pipeline_v2.py` in SGT / UTC+8), Telegram webhook commands, and `gemini-3.8-flash` bot rules.
+
 ---
 
 # bot-hub
