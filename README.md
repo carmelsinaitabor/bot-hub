@@ -1,3 +1,10 @@
+## Quick Context Recovery (New Gemini Chat)
+**Run `ctx` in Cloud Shell (or paste this command) to dump the full system architecture:**
+
+**`gh api repos/carmelsinaitabor/bot-hub/contents/SYSTEM_ARCHITECTURE.md --jq '.content' | base64 -d`**
+
+---
+
 # bot-hub
 
 <!-- BOT_CLI_HELPERS_START -->
