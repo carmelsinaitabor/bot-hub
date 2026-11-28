@@ -129,7 +129,7 @@ jobs:
           )
 
           resp = None
-          for m in ("gemini-3.8-flash", "gemini-3.5-flash-lite"):
+          for m in ("gemini-3.8-flash", "gemini-3.8-flash"):
               try:
                   resp = client.models.generate_content(model=m, contents=prompt)
                   break
